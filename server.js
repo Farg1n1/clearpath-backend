@@ -16,7 +16,7 @@ app.use(express.json());
 // Lock this to YOUR live site so randoms can't burn your API credit.
 // Replace the placeholder with your real Netlify URL.
 const ALLOWED_ORIGINS = [
-  "https://YOUR-SITE.netlify.app",
+  "https://clever-clafoutis-d7d5ed.netlify.app",
   "http://localhost:3000", // for local testing
 ];
 app.use(
