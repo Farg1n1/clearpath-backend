@@ -12,9 +12,11 @@ const cors = require("cors");
 const app = express();
 app.use(express.json());
 
+// trust the proxy in front of us (Render) so we read the REAL
+// visitor IP, not Render's internal one.
+app.set("trust proxy", true);
+
 // --- CORS: who is allowed to call this proxy ---------------------
-// Lock this to YOUR live site so randoms can't burn your API credit.
-// Replace the placeholder with your real Netlify URL.
 const ALLOWED_ORIGINS = [
   "https://clever-clafoutis-d7d5ed.netlify.app",
   "http://localhost:3000", // for local testing
@@ -22,20 +24,30 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow same-origin / curl (no origin) and the listed sites
       if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error("Not allowed by CORS"));
     },
   })
 );
 
+// --- USAGE LIMIT --------------------------------------------------
+// How many free questions before the paywall.
+const FREE_LIMIT = 3;
+
+// In-memory count of questions per IP. NOTE: this resets whenever
+// the server sleeps/restarts (Render free tier). Good enough to stop
+// casual credit-draining now; swap for a tiny database later when
+// there's revenue to justify it.
+const usageByIp = {};
+
 // --- The ClearPath system prompt ---------------------------------
-// This is what makes the bot ClearPath and not generic Claude.
 const SYSTEM_PROMPT = `You are ClearPath, a permit and zoning assistant built specifically for Halifax Regional Municipality (HRM), Nova Scotia.
 
 You translate HRM's bureaucratic language into plain English. You help people understand what permits they need, what the process looks like, what documents to gather, and who to contact. You do not replace HRM staff — you make them easier to reach and their processes easier to understand.
 
 SCOPE: You are scoped exclusively to Halifax Regional Municipality (HRM). If a question falls outside HRM jurisdiction (provincial, federal, or another municipality), say so clearly and direct the user to the appropriate body.
+
+ANSWER COMPLETELY THE FIRST TIME. When someone asks about a permit or process, give them the whole picture in one response — don't hand back a thin reply and offer to continue. A complete answer walks through, where relevant: whether they need a permit at all, the steps in order, the fees, the typical timeline, and exactly who to contact. The goal is that one good question gives them everything they need to act, sourced. Be thorough but not padded — every line should carry real information, not filler.
 
 WHEN YOU KNOW THE ANSWER:
 - Answer clearly and in plain language.
@@ -50,7 +62,13 @@ Do not guess. Say: "I don't have a confident answer on that — here's who does.
 
 SAFETY & LIABILITY: If a question involves anything potentially illegal, a liability risk (building without permits, unpermitted occupancy), or dangerous (structural, fire code, safety), flag it: "This is something you'll want to speak with an HRM professional about directly — not something I should advise on." Then route to the right contact. Never green-light anything that requires a licensed professional's sign-off.
 
-TONE: Direct, clear, human. Don't lecture or pad. Three-sentence answer if three sentences is enough; numbered list for a process.
+TONE: Direct, clear, human. Don't lecture or pad. Numbered list for a process.
+
+VOICE & FORMATTING (follow strictly):
+- Never use em-dashes (—). Use a comma, a period, or parentheses instead.
+- Never use asterisks for bold or any markdown styling (no **bold**, no *italics*, no # headers). Write in plain sentences. For a sequence of steps, use a simple numbered list (1. 2. 3.). The only formatting allowed is links in the form [text](url) for sources.
+- Use straight quotes (") and straight apostrophes ('), never curly ones.
+- Use plain, simple language. Short sentences. Everyday words over bureaucratic or technical ones. If you must use an official term (a bylaw number, a permit name), say it in plain English first, then name it. Write so a busy person with no background in permits understands it on the first read.
 
 WHAT YOU ARE NOT: Not a lawyer, licensed planner, or HRM employee. Cannot approve, reject, or accelerate any application. State this naturally when relevant, not as a boilerplate footer.
 
@@ -63,6 +81,20 @@ app.post("/api/chat", async (req, res) => {
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages array is required" });
+    }
+
+    // --- usage check: count this IP's questions ------------------
+    const ip = req.ip || "unknown";
+    const used = usageByIp[ip] || 0;
+
+    if (used >= FREE_LIMIT) {
+      // They're out of free questions. Tell the frontend to show the
+      // paywall. We DON'T call Anthropic, so this costs nothing.
+      return res.json({
+        limitReached: true,
+        reply:
+          "You've used your free questions. To keep getting plain-English, sourced answers on Halifax permits, please subscribe.",
+      });
     }
 
     const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -100,13 +132,14 @@ app.post("/api/chat", async (req, res) => {
       data.content?.find((b) => b.type === "text")?.text ||
       "Sorry, I couldn't generate a response.";
 
-    // --- usage counting hook -------------------------------------
-    // This is where you increment a counter per user later, so the
-    // business model works (free queries, then pay). For now we just
-    // log it. It CANNOT be bypassed client-side because it lives here.
-    console.log("Query served. Tokens:", data.usage);
+    // Only count it AFTER a successful answer, so a failed request
+    // doesn't burn one of their free questions.
+    usageByIp[ip] = used + 1;
+    const remaining = Math.max(0, FREE_LIMIT - usageByIp[ip]);
 
-    return res.json({ reply });
+    console.log(`Query served to ${ip}. Used ${usageByIp[ip]}/${FREE_LIMIT}. Tokens:`, data.usage);
+
+    return res.json({ reply, remaining });
   } catch (err) {
     console.error("Proxy error:", err);
     return res.status(500).json({ error: "Something went wrong" });
